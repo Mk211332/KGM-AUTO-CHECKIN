@@ -40,9 +40,11 @@ jobs:
             exit 1
           fi
 
-          # 北京时间当前分钟数（Actions 运行环境为 UTC，手动加 8 小时）
-          NOW_MIN=$(TZ=Asia/Shanghai date +%H%M | sed 's/^0*//')
-          echo "北京时间 $(TZ=Asia/Shanghai date +%H:%M)，在线时段 $(TZ=Asia/Shanghai date -d "00:00" +%H:%M)–$(TZ=Asia/Shanghai date -d "02:00" +%H:%M)"
+          # 北京时间当前累计分钟数（Actions 运行环境为 UTC，按上海时区换算）
+          NOW_H=$(TZ=Asia/Shanghai date +%_H)
+          NOW_M=$(TZ=Asia/Shanghai date +%M)
+          NOW_MIN=$((10#$NOW_H * 60 + 10#$NOW_M))
+          echo "北京时间 $(TZ=Asia/Shanghai date +%H:%M)，在线时段 00:00–02:00"
 
           # 读取机器状态
           state=$(curl -sS -m 30 -H "X-API-Key: $INSTABOX_API_KEY" \
@@ -63,9 +65,9 @@ jobs:
             exit 0
           fi
 
-          # 时段内：非 running 先唤醒（resume 优先，start 兜底）
+          # 时段内：非 running 先唤醒（resume 兜底手动暂停，start 兜底停止，wake 兜底空闲休眠）
           if [ "$state" != "running" ]; then
-            for act in resume start; do
+            for act in resume start wake; do
               code=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' -X POST \
                 -H "X-API-Key: $INSTABOX_API_KEY" \
                 -H "Idempotency-Key: gh-$act-$ID-$(date +%s)" \
