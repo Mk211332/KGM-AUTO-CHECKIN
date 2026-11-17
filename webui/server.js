@@ -42,6 +42,7 @@
 import express from 'express'
 import cron from 'node-cron'
 import crypto from 'node:crypto'
+import zlib from 'node:zlib'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -658,7 +659,69 @@ if (WEBUI_TRUST_PROXY !== false) {
   app.set('trust proxy', WEBUI_TRUST_PROXY)
 }
 app.use(express.json())
-app.use(express.static(path.join(__dirname, 'public')))
+// ── gzip 压缩：对文本类响应（html/js/css/json/svg）按需压缩，减小公网传输体积 ──
+// 注意：Express 静态/流式响应会在 write 首块时就下发响应头，因此必须在首块写出前
+// 设定 Content-Encoding；不能等到 end() 再 setHeader（会触发 ERR_HTTP_HEADERS_SENT）。
+const COMPRESSIBLE = /^(text\/|application\/(javascript|json|xml|svg)|image\/svg\+xml)/
+app.use((req, res, next) => {
+  const accept = String(req.headers['accept-encoding'] || '')
+  const wantsGzip = accept.includes('gzip')
+  const rawWrite = res.write.bind(res)
+  const rawEnd = res.end.bind(res)
+  const chunks = []
+  let gzipped = false
+  let headerLocked = false
+
+  const flushHeadersIfNeeded = () => {
+    if (headerLocked) return
+    headerLocked = true
+    if (gzipped) res.setHeader('Content-Encoding', 'gzip')
+  }
+
+  res.write = (chunk, encoding, cb) => {
+    if (!chunk) return rawWrite(chunk, encoding, cb)
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding)
+    // 在首块写出前依据类型/状态决定是否压缩，避免流已下发头后再改头
+    if (!headerLocked) {
+      const type = String(res.getHeader('content-type') || '')
+      const status = res.statusCode
+      gzipped = wantsGzip && COMPRESSIBLE.test(type) && status >= 200 && status < 300
+      flushHeadersIfNeeded()
+    }
+    chunks.push(buf)
+    if (gzipped) return true
+    return rawWrite(chunk, encoding, cb)
+  }
+  res.end = (chunk, encoding, cb) => {
+    if (chunk) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding)
+      if (!headerLocked) {
+        const type = String(res.getHeader('content-type') || '')
+        const status = res.statusCode
+        gzipped = wantsGzip && COMPRESSIBLE.test(type) && status >= 200 && status < 300
+        flushHeadersIfNeeded()
+      }
+      chunks.push(buf)
+    }
+    try {
+      if (!gzipped) return rawEnd(chunk, encoding, cb)
+      const buf = Buffer.concat(chunks)
+      const gz = zlib.gzipSync(buf, { level: 6 })
+      res.setHeader('Content-Length', gz.length)
+      return rawEnd(gz, encoding, cb)
+    } catch (err) {
+      return rawEnd(chunk, encoding, cb)
+    }
+  }
+  next()
+})
+
+// 静态资源：带长缓存（内容不变浏览器直接复用；更新后文件名/部署会刷新）
+app.use(express.static(path.join(__dirname, 'public'), {
+  maxAge: '7d',
+  etag: true,
+  lastModified: true,
+}))
 
 /** 请求来源 IP（统一入口，便于后续调整代理策略） */
 function clientIp(req) {
